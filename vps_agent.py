@@ -9,19 +9,22 @@ Endpoints (all require token except /health and /register-if-not-configured):
     GET  /health                       -> status, uptime, port
     POST /register      {token}        -> set initial token
     POST /update-token  {new_token}    -> rotate token
-    GET  /info                         -> hostname, OS, uptime, mem, disk, services (NO tmux)
+    GET  /info                         -> hostname, OS, uptime, mem, disk, services
     GET  /tmux                         -> all tmux sessions across users (rich JSON)
     POST /tmux/kill      {user,session} -> kill-session
     GET  /tmux/logs?user=X&session=Y&lines=N -> capture-pane output
     POST /service/<name>/<action>      -> systemctl start/stop/restart/status
     GET  /logs/<service>?lines=N      -> journalctl tail
     POST /restart                      -> reboot server (3s delay)
+    POST /update-code    {code}        -> replace agent.py and restart (auto-rollback on syntax error)
+    POST /restore-code                 -> restore agent.py from .bak backup
 """
 import os
 import re
 import json
 import glob
 import pwd
+import shutil
 import socket
 import subprocess
 from collections import defaultdict
@@ -35,6 +38,8 @@ app = Flask(__name__)
 INSTALL_DIR = '/opt/vps-agent'
 TOKEN_FILE = os.path.join(INSTALL_DIR, 'token')
 PORT_FILE = os.path.join(INSTALL_DIR, 'port')
+AGENT_FILE = os.path.join(INSTALL_DIR, 'agent.py')
+BACKUP_FILE = os.path.join(INSTALL_DIR, 'agent.py.bak')
 
 # Rate limiting: 10 requests / 60s per IP (slows down brute-force scanners)
 _rate = defaultdict(list)
@@ -180,12 +185,10 @@ def _list_tmux_sessions_for_socket(sock, user):
             if len(parts) < 5:
                 continue
             name, windows_str, created_str, attached_str, sess_path = parts[:5]
-            # Convert created timestamp to ISO format
             try:
                 created_iso = datetime.fromtimestamp(int(created_str)).isoformat()
             except Exception:
                 created_iso = created_str
-            # Get panes for this session (info about what's running in each pane)
             panes = []
             try:
                 pr = subprocess.run(
@@ -411,6 +414,62 @@ def restart():
         return jsonify({"ok": True, "message": "Rebooting in 3 seconds..."})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/update-code', methods=['POST'])
+def update_code():
+    """Replace agent.py with new code from manager.
+    Body: {"code": "..."} - replaces /opt/vps-agent/agent.py and restarts service.
+    Auto-rolls back to backup if syntax check fails.
+    """
+    d = request.get_json() or {}
+    code = d.get('code', '')
+    if not code or len(code) < 200:
+        return jsonify({"error": "no code provided or code too short"}), 400
+    # Sanity check: must look like the agent
+    if 'from flask import' not in code or 'INSTALL_DIR' not in code:
+        return jsonify({"error": "code doesn't look like the vps-agent"}), 400
+    # Backup current
+    try:
+        shutil.copy2(AGENT_FILE, BACKUP_FILE)
+    except Exception as e:
+        return jsonify({"error": f"backup failed: {e}"}), 500
+    # Write to a temp file first, validate syntax, then move
+    tmp_path = AGENT_FILE + '.new'
+    try:
+        with open(tmp_path, 'w') as f:
+            f.write(code)
+        # Syntax check
+        r = subprocess.run(
+            ['python3', '-c', f'import ast; ast.parse(open("{tmp_path}").read())'],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            os.unlink(tmp_path)
+            return jsonify({"error": f"syntax error in new code: {r.stderr.strip()}"}), 400
+        # Move into place
+        os.replace(tmp_path, AGENT_FILE)
+    except Exception as e:
+        # Try to restore backup
+        try: shutil.copy2(BACKUP_FILE, AGENT_FILE)
+        except: pass
+        return jsonify({"error": f"write failed: {e}"}), 500
+    # Schedule restart in background (so the response can be sent first)
+    subprocess.Popen(['bash', '-c', 'sleep 2 && systemctl restart vps-agent'])
+    return jsonify({"ok": True, "message": "Code updated. Restarting agent in 2s..."})
+
+
+@app.route('/restore-code', methods=['POST'])
+def restore_code():
+    """Restore agent.py from .bak backup. Useful if a bad update broke something."""
+    if not os.path.exists(BACKUP_FILE):
+        return jsonify({"error": "no backup exists"}), 404
+    try:
+        shutil.copy2(BACKUP_FILE, AGENT_FILE)
+        subprocess.Popen(['bash', '-c', 'sleep 2 && systemctl restart vps-agent'])
+        return jsonify({"ok": True, "message": "Restored from backup. Restarting..."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
