@@ -55,7 +55,29 @@ echo "DISK_USED:$(df -h / | awk 'NR==2{print $3}')"
 echo "DISK_TOTAL:$(df -h / | awk 'NR==2{print $2}')"
 echo "DISK_PCT:$(df / | awk 'NR==2{print $5}' | tr -d '%')"
 echo "===TMUX==="
-if command -v tmux > /dev/null; then tmux ls 2>/dev/null || echo "No active TMUX sessions."; else echo "TMUX is not installed."; fi
+if command -v tmux > /dev/null; then
+    found=0
+    for sock in /tmp/tmux-*/default; do
+        [ -S "$sock" ] || continue
+        user_dir=$(basename $(dirname "$sock"))
+        uid=${user_dir#tmux-}
+        if [ "$uid" = "0" ]; then
+            user="root"
+        else
+            user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+            [ -z "$user" ] && user="uid=$uid"
+        fi
+        sessions=$(tmux -S "$sock" ls 2>/dev/null)
+        if [ -n "$sessions" ]; then
+            echo "USER:$user"
+            echo "$sessions"
+            found=1
+        fi
+    done
+    [ "$found" = "0" ] && echo "No active TMUX sessions."
+else
+    echo "TMUX is not installed."
+fi
 echo "===SERVICES==="
 systemctl list-units --type=service --all --no-pager --no-legend | awk -F' ' '{d="";for(i=5;i<=NF;i++)d=d (i>5?" ":"")$i;print $1"|"$3"|"$4"|"d}'
 '''
@@ -195,8 +217,29 @@ def info():
 
 @app.route('/tmux')
 def tmux():
+    """List TMUX sessions across all users (agent runs as root, so it can read every user's socket)."""
     try:
-        r = subprocess.run(['bash', '-c', 'tmux ls 2>/dev/null'], capture_output=True, text=True, timeout=10)
+        cmd = '''found=0
+for sock in /tmp/tmux-*/default; do
+    [ -S "$sock" ] || continue
+    user_dir=$(basename $(dirname "$sock"))
+    uid=${user_dir#tmux-}
+    if [ "$uid" = "0" ]; then
+        user="root"
+    else
+        user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+        [ -z "$user" ] && user="uid=$uid"
+    fi
+    sessions=$(tmux -S "$sock" ls 2>/dev/null)
+    if [ -n "$sessions" ]; then
+        echo "USER:$user"
+        echo "$sessions"
+        echo ""
+        found=1
+    fi
+done
+[ "$found" = "0" ] && echo "No active TMUX sessions."'''
+        r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
         out = r.stdout.strip()
         if not out:
             check = subprocess.run(['bash', '-c', 'command -v tmux'], capture_output=True, text=True)
