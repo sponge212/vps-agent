@@ -9,8 +9,10 @@ Endpoints (all require token except /health and /register-if-not-configured):
     GET  /health                       -> status, uptime, port
     POST /register      {token}        -> set initial token
     POST /update-token  {new_token}    -> rotate token
-    GET  /info                         -> hostname, OS, uptime, mem, disk, tmux, services
-    GET  /tmux                         -> tmux sessions
+    GET  /info                         -> hostname, OS, uptime, mem, disk, services (NO tmux)
+    GET  /tmux                         -> all tmux sessions across users (rich JSON)
+    POST /tmux/kill      {user,session} -> kill-session
+    GET  /tmux/logs?user=X&session=Y&lines=N -> capture-pane output
     POST /service/<name>/<action>      -> systemctl start/stop/restart/status
     GET  /logs/<service>?lines=N      -> journalctl tail
     POST /restart                      -> reboot server (3s delay)
@@ -18,9 +20,12 @@ Endpoints (all require token except /health and /register-if-not-configured):
 import os
 import re
 import json
+import glob
+import pwd
 import socket
 import subprocess
 from collections import defaultdict
+from datetime import datetime
 from time import time
 
 from flask import Flask, request, jsonify
@@ -44,6 +49,7 @@ def rate_ok(ip, max_req=10, window=60):
     return True
 
 
+# INFO_CMD no longer contains TMUX (we have a dedicated /tmux endpoint now)
 INFO_CMD = '''echo "HOSTNAME:$(hostname)"
 echo "OS:$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
 echo "UPTIME:$(uptime -p)"
@@ -54,30 +60,6 @@ echo "MEM_TOTAL:$(free -m | awk '/Mem/{print $2}')"
 echo "DISK_USED:$(df -h / | awk 'NR==2{print $3}')"
 echo "DISK_TOTAL:$(df -h / | awk 'NR==2{print $2}')"
 echo "DISK_PCT:$(df / | awk 'NR==2{print $5}' | tr -d '%')"
-echo "===TMUX==="
-if command -v tmux > /dev/null; then
-    found=0
-    for sock in /tmp/tmux-*/default; do
-        [ -S "$sock" ] || continue
-        user_dir=$(basename $(dirname "$sock"))
-        uid=${user_dir#tmux-}
-        if [ "$uid" = "0" ]; then
-            user="root"
-        else
-            user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-            [ -z "$user" ] && user="uid=$uid"
-        fi
-        sessions=$(tmux -S "$sock" ls 2>/dev/null)
-        if [ -n "$sessions" ]; then
-            echo "USER:$user"
-            echo "$sessions"
-            found=1
-        fi
-    done
-    [ "$found" = "0" ] && echo "No active TMUX sessions."
-else
-    echo "TMUX is not installed."
-fi
 echo "===SERVICES==="
 systemctl list-units --type=service --all --no-pager --no-legend | awk -F' ' '{d="";for(i=5;i<=NF;i++)d=d (i>5?" ":"")$i;print $1"|"$3"|"$4"|"d}'
 '''
@@ -149,6 +131,113 @@ def check_token():
     return authz[7:] == token
 
 
+# ---------- tmux helpers ----------
+
+def _uid_to_user(uid):
+    """Convert UID to username. Returns 'root' for 0, 'uid=N' if unknown."""
+    if uid == 0:
+        return 'root'
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f'uid={uid}'
+
+
+def _user_to_uid(user):
+    """Convert username to UID. Returns None on failure."""
+    if user == 'root':
+        return 0
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None
+
+
+def _find_tmux_socket(user):
+    """Return the tmux socket path for the given user, or None if no socket exists."""
+    uid = _user_to_uid(user)
+    if uid is None:
+        return None
+    sock = f'/tmp/tmux-{uid}/default'
+    return sock if (os.path.exists(sock) and os.path.isdir(os.path.dirname(sock))) else None
+
+
+def _list_tmux_sessions_for_socket(sock, user):
+    """List all tmux sessions on a single socket with full details."""
+    sessions = []
+    try:
+        r = subprocess.run(
+            ['tmux', '-S', sock, 'ls', '-F',
+             '#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_path}'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return sessions
+        for line in r.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) < 5:
+                continue
+            name, windows_str, created_str, attached_str, sess_path = parts[:5]
+            # Convert created timestamp to ISO format
+            try:
+                created_iso = datetime.fromtimestamp(int(created_str)).isoformat()
+            except Exception:
+                created_iso = created_str
+            # Get panes for this session (info about what's running in each pane)
+            panes = []
+            try:
+                pr = subprocess.run(
+                    ['tmux', '-S', sock, 'list-panes', '-a', '-t', name, '-F',
+                     '#{pane_id}|#{pane_current_command}|#{pane_pid}|#{pane_current_path}|#{window_index}'],
+                    capture_output=True, text=True, timeout=5
+                )
+                for pline in pr.stdout.strip().split('\n'):
+                    if not pline:
+                        continue
+                    pparts = pline.split('|')
+                    if len(pparts) >= 5:
+                        panes.append({
+                            'id': pparts[0],
+                            'command': pparts[1],
+                            'pid': pparts[2],
+                            'path': pparts[3],
+                            'window': pparts[4]
+                        })
+            except Exception:
+                pass
+            sessions.append({
+                'user': user,
+                'name': name,
+                'windows': int(windows_str) if windows_str.isdigit() else 0,
+                'created': created_iso,
+                'attached': attached_str == '1',
+                'path': sess_path,
+                'panes': panes
+            })
+    except Exception:
+        pass
+    return sessions
+
+
+def _list_all_tmux_sessions():
+    """Iterate through all /tmp/tmux-*/default sockets and collect sessions from each."""
+    sessions = []
+    for sock in glob.glob('/tmp/tmux-*/default'):
+        if not os.path.issocket(sock) and not os.path.exists(sock):
+            continue
+        user_dir = os.path.basename(os.path.dirname(sock))
+        uid_str = user_dir.replace('tmux-', '', 1)
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+        user = _uid_to_user(uid)
+        sessions.extend(_list_tmux_sessions_for_socket(sock, user))
+    return sessions
+
+
 # ---------- auth + rate limit ----------
 
 @app.before_request
@@ -216,39 +305,74 @@ def info():
 
 
 @app.route('/tmux')
-def tmux():
-    """List TMUX sessions across all users (agent runs as root, so it can read every user's socket)."""
+def tmux_list():
+    """List all TMUX sessions across all users with rich details (panes, attached, etc.)."""
     try:
-        cmd = '''found=0
-for sock in /tmp/tmux-*/default; do
-    [ -S "$sock" ] || continue
-    user_dir=$(basename $(dirname "$sock"))
-    uid=${user_dir#tmux-}
-    if [ "$uid" = "0" ]; then
-        user="root"
-    else
-        user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-        [ -z "$user" ] && user="uid=$uid"
-    fi
-    sessions=$(tmux -S "$sock" ls 2>/dev/null)
-    if [ -n "$sessions" ]; then
-        echo "USER:$user"
-        echo "$sessions"
-        echo ""
-        found=1
-    fi
-done
-[ "$found" = "0" ] && echo "No active TMUX sessions."'''
-        r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=10)
-        out = r.stdout.strip()
-        if not out:
+        sessions = _list_all_tmux_sessions()
+        if not sessions:
             check = subprocess.run(['bash', '-c', 'command -v tmux'], capture_output=True, text=True)
             if not check.stdout.strip():
-                return jsonify({"output": "TMUX is not installed on this server."})
-            return jsonify({"output": "No active TMUX sessions."})
-        return jsonify({"output": out})
+                return jsonify({"output": "TMUX is not installed on this server.", "sessions": []})
+            return jsonify({"output": "No active TMUX sessions.", "sessions": []})
+        # Backward-compat text format
+        text_lines = []
+        for s in sessions:
+            text_lines.append(f"USER:{s['user']}")
+            text_lines.append(f"{s['name']}: {s['windows']} windows (created {s['created']}){' (attached)' if s['attached'] else ''}")
+        return jsonify({"output": '\n'.join(text_lines), "sessions": sessions})
+    except Exception as e:
+        return jsonify({"output": "", "error": str(e), "sessions": []}), 500
+
+
+@app.route('/tmux/kill', methods=['POST'])
+def tmux_kill():
+    """Kill a tmux session. Body: {"user": "bob", "session": "dev"}."""
+    d = request.get_json() or {}
+    user = d.get('user', '')
+    session = d.get('session', '')
+    if not user or not session:
+        return jsonify({"error": "user and session required"}), 400
+    if not NAME_RE.match(session):
+        return jsonify({"error": "invalid session name"}), 400
+    sock = _find_tmux_socket(user)
+    if not sock:
+        return jsonify({"error": f"no tmux socket for user '{user}'"}), 404
+    try:
+        r = subprocess.run(['tmux', '-S', sock, 'kill-session', '-t', session],
+                          capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return jsonify({"ok": False, "error": r.stderr.strip() or 'kill-session failed'}), 400
+        return jsonify({"ok": True, "message": f"Session '{session}' (user: {user}) killed"})
     except subprocess.TimeoutExpired:
-        return jsonify({"output": "", "error": "timeout"}), 504
+        return jsonify({"error": "timeout"}), 504
+
+
+@app.route('/tmux/logs')
+def tmux_logs():
+    """Capture last N lines of a tmux pane's output.
+    Query: ?user=bob&session=dev&lines=100
+    """
+    user = request.args.get('user', '')
+    session = request.args.get('session', '')
+    try:
+        n = max(1, min(int(request.args.get('lines', '100')), 1000))
+    except ValueError:
+        n = 100
+    if not user or not session:
+        return jsonify({"error": "user and session required"}), 400
+    if not NAME_RE.match(session):
+        return jsonify({"error": "invalid session name"}), 400
+    sock = _find_tmux_socket(user)
+    if not sock:
+        return jsonify({"error": f"no tmux socket for user '{user}'"}), 404
+    try:
+        r = subprocess.run(
+            ['tmux', '-S', sock, 'capture-pane', '-p', '-t', session, '-S', f'-{n}'],
+            capture_output=True, text=True, timeout=10
+        )
+        return jsonify({"logs": r.stdout, "rc": r.returncode})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "timeout"}), 504
 
 
 @app.route('/service/<name>/<action>', methods=['POST'])
