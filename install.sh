@@ -28,8 +28,9 @@ echo "================================================"
 echo ""
 
 # 1) Get the token from user
+# Force read from /dev/tty because stdin is the curl pipe when run as `curl | bash`.
 echo "Paste the token your manager gave you, then press Enter:"
-read -r USER_TOKEN
+read -r USER_TOKEN </dev/tty
 [ -z "$USER_TOKEN" ] && { echo "Error: token is required. Run again."; exit 1; }
 echo ""
 
