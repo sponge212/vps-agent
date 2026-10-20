@@ -11,6 +11,7 @@
 Paste your token when asked.
 
 The script prints your IP, port, and token. Send them to your manager.
+
 Uninstall
 
 `curl -sL https://raw.githubusercontent.com/sponge212/vps-agent/main/uninstall.sh | sudo bash`
