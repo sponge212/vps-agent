@@ -228,7 +228,8 @@ def _list_all_tmux_sessions():
     """Iterate through all /tmp/tmux-*/default sockets and collect sessions from each."""
     sessions = []
     for sock in glob.glob('/tmp/tmux-*/default'):
-        if not os.path.issocket(sock) and not os.path.exists(sock):
+        # Skip if path doesn't exist (stale glob match)
+        if not os.path.exists(sock):
             continue
         user_dir = os.path.basename(os.path.dirname(sock))
         uid_str = user_dir.replace('tmux-', '', 1)
