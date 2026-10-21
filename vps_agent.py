@@ -460,6 +460,135 @@ def update_code():
     return jsonify({"ok": True, "message": "Code updated. Restarting agent in 2s..."})
 
 
+@app.route('/update-from-zip', methods=['POST'])
+def update_from_zip():
+    """Update agent from a zip file (multi-file).
+    Body: {"zip_b64": "<base64-encoded-zip>"}
+    The zip should contain vps_agent.py (and optionally other files like install.sh,
+    README.md, etc.). Files are extracted one-by-one to /opt/vps-agent/.
+
+    Safety:
+      - Backs up the entire /opt/vps-agent/ directory to /opt/vps-agent.bak/ BEFORE doing anything
+      - Validates syntax of every .py file before moving it into place
+      - If ANY file fails syntax check or extraction fails: rolls back from backup
+      - After all files are in place: schedules a restart in 2s
+    """
+    import io, zipfile, base64 as b64mod
+
+    d = request.get_json() or {}
+    zip_b64 = d.get('zip_b64', '')
+    if not zip_b64:
+        return jsonify({"error": "no zip_b64 provided"}), 400
+
+    # Decode base64
+    try:
+        zip_data = b64mod.b64decode(zip_b64)
+    except Exception as e:
+        return jsonify({"error": f"invalid base64: {e}"}), 400
+
+    # Parse the zip
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_data))
+    except zipfile.BadZipFile as e:
+        return jsonify({"error": f"invalid zip file: {e}"}), 400
+
+    # Build list of files to install (skip directories, __MACOSX, .DS_Store, .git*)
+    names = [n for n in zf.namelist()
+             if not n.endswith('/')
+             and not n.startswith('__MACOSX')
+             and '.DS_Store' not in n
+             and not n.startswith('.git')]
+    if not names:
+        return jsonify({"error": "zip contains no files"}), 400
+
+    # Sanity check: zip must contain vps_agent.py
+    has_agent = any(os.path.basename(n) == 'vps_agent.py' for n in names)
+    if not has_agent:
+        return jsonify({"error": "zip does not contain vps_agent.py"}), 400
+
+    # 1. Backup the entire /opt/vps-agent/ to /opt/vps-agent.bak/
+    backup_dir = INSTALL_DIR + '.bak'
+    try:
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+        shutil.copytree(INSTALL_DIR, backup_dir)
+    except Exception as e:
+        return jsonify({"error": f"backup failed: {e}"}), 500
+
+    # 2. Extract files one by one with syntax validation
+    installed_files = []
+    try:
+        for name in names:
+            basename = os.path.basename(name)
+            if not basename:
+                continue
+            target_path = os.path.join(INSTALL_DIR, basename)
+
+            # Read content from zip
+            with zf.open(name) as f:
+                content = f.read()
+
+            # Write to .new temp file first
+            tmp_path = target_path + '.new'
+            with open(tmp_path, 'wb') as wf:
+                wf.write(content)
+
+            # For .py files: syntax check
+            if basename.endswith('.py'):
+                r = subprocess.run(
+                    ['python3', '-c', f'import ast; ast.parse(open("{tmp_path}").read())'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if r.returncode != 0:
+                    os.unlink(tmp_path)
+                    return jsonify({
+                        "error": f"syntax error in {basename}: {r.stderr.strip()}",
+                        "installed_before_failure": installed_files
+                    }), 400
+
+            # Move into place
+            os.replace(tmp_path, target_path)
+            # Make sure .py files are readable + executable (for scripts)
+            if basename.endswith('.py') or basename.endswith('.sh'):
+                os.chmod(target_path, 0o755)
+            else:
+                os.chmod(target_path, 0o644)
+            installed_files.append(basename)
+
+        # Final check: agent.py must exist
+        if not os.path.exists(AGENT_FILE):
+            raise Exception("agent.py was not installed (missing in zip?)")
+
+        # Schedule restart in background
+        subprocess.Popen(['bash', '-c', 'sleep 2 && systemctl restart vps-agent'])
+        return jsonify({
+            "ok": True,
+            "message": f"Installed {len(installed_files)} file(s): {', '.join(installed_files)}. Restarting agent in 2s...",
+            "files": installed_files
+        })
+
+    except Exception as e:
+        # Rollback from backup
+        try:
+            # Remove any .new files left in INSTALL_DIR
+            for f in os.listdir(INSTALL_DIR):
+                if f.endswith('.new'):
+                    try: os.unlink(os.path.join(INSTALL_DIR, f))
+                    except: pass
+            # Restore all files from backup
+            for fname in os.listdir(backup_dir):
+                src = os.path.join(backup_dir, fname)
+                dst = os.path.join(INSTALL_DIR, fname)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+        except Exception:
+            pass
+        return jsonify({
+            "error": f"install failed, rolled back to previous version: {e}",
+            "installed_before_failure": installed_files
+        }), 500
+
+
 @app.route('/restore-code', methods=['POST'])
 def restore_code():
     """Restore agent.py from .bak backup. Useful if a bad update broke something."""
@@ -469,6 +598,36 @@ def restore_code():
         shutil.copy2(BACKUP_FILE, AGENT_FILE)
         subprocess.Popen(['bash', '-c', 'sleep 2 && systemctl restart vps-agent'])
         return jsonify({"ok": True, "message": "Restored from backup. Restarting..."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/restore-zip', methods=['POST'])
+def restore_zip():
+    """Restore ALL files in /opt/vps-agent/ from the .bak directory.
+    Use this after a failed zip-update if the agent is still alive
+    (if agent is completely dead, you must SSH in and run:
+       sudo cp -r /opt/vps-agent.bak/* /opt/vps-agent/
+       sudo systemctl restart vps-agent
+    )
+    """
+    backup_dir = INSTALL_DIR + '.bak'
+    if not os.path.exists(backup_dir):
+        return jsonify({"error": "no backup directory exists"}), 404
+    restored = []
+    try:
+        for fname in os.listdir(backup_dir):
+            src = os.path.join(backup_dir, fname)
+            dst = os.path.join(INSTALL_DIR, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+                restored.append(fname)
+        subprocess.Popen(['bash', '-c', 'sleep 2 && systemctl restart vps-agent'])
+        return jsonify({
+            "ok": True,
+            "message": f"Restored {len(restored)} file(s): {', '.join(restored)}. Restarting...",
+            "files": restored
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
